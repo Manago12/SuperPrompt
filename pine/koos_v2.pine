@@ -1,0 +1,179 @@
+//@version=6
+// KOOS v2  --  Kernel-Ordered Optimal Stopping
+//
+// Bridges three papers:
+//   [1] Derbazi 2026a  -- Thm 3.5: kernel monotone/concave criteria for >=_lr/>=_lc
+//   [2] Derbazi 2026b  -- Prop 2.9: superlevel-set endpoint criterion
+//   [3] Gnedin  2026   -- Thm 1: beta(2) hyperbolic stopping; Thm 3: discrete cutoffs
+//
+// Entry: direct empirical >=_st  (Sbar_curr >= Sbar_base pointwise).  Prop 2.9
+//        and Paper-1 kernel shape are reported as diagnostics, not gates, because
+//        they are sufficient-but-not-necessary and fire ~0% on noisy histograms.
+// Exit : Gnedin's beta-2 rule  x_now <= 2/(T-t)  with x_now = adverse log-excursion.
+strategy("KOOS v2", overlay = true, initial_capital = 10000,
+     default_qty_type       = strategy.percent_of_equity, default_qty_value = 100,
+     pyramiding             = 0,
+     calc_on_every_tick     = false,
+     process_orders_on_close= true)
+
+// ---------------- inputs ----------------
+nBase    = input.int  (200, "Baseline N",         minval = 50)
+nCurr    = input.int  (50 , "Current  n",         minval = 20)
+nBins    = input.int  (21 , "Bins (odd)",         minval = 9)
+binHalf  = input.float(2.5, "Half-range (sigmas)",minval = 0.5)
+Tbars    = input.int  (40 , "Horizon T (bars)",   minval = 10)
+endpMrg  = input.float(0.05,"ell(x0)-1 diag margin", minval = 0.0, step = 0.01)
+useDelta = input.bool (false,"Discrete delta_k rank exit")
+rankK    = input.int  (2  , "Rank floor k",       minval = 1, maxval = 11)
+
+// ---------------- log-returns + adaptive grid ----------------
+r   = math.log(close / nz(close[1], close))
+mu  = ta.sma  (r, nBase + nCurr)
+sig = ta.stdev(r, nBase + nCurr)
+binW = (2.0 * binHalf * sig) / nBins
+
+binIdx(x) =>
+    raw = math.floor((x - (mu - binHalf * sig)) / binW)
+    math.max(0, math.min(nBins - 1, raw))
+
+// ---------------- empirical histograms (P = baseline, Q = current) ----------------
+fC = array.new<float>(nBins, 0.0)
+fB = array.new<float>(nBins, 0.0)
+if not na(sig) and sig > 0
+    for j = 0 to nCurr - 1
+        b = binIdx(r[j]),  array.set(fC, b, array.get(fC, b) + 1.0)
+    for j = nCurr to nCurr + nBase - 1
+        b = binIdx(r[j]),  array.set(fB, b, array.get(fB, b) + 1.0)
+    for i = 0 to nBins - 1                                       // Laplace smoothing
+        array.set(fC, i, (array.get(fC, i) + 1.0) / (nCurr + nBins))
+        array.set(fB, i, (array.get(fB, i) + 1.0) / (nBase + nBins))
+    // 3-bin moving-average smoothing of densities
+    fCs = array.new<float>(nBins, 0.0)
+    fBs = array.new<float>(nBins, 0.0)
+    for i = 0 to nBins - 1
+        iL = math.max(0, i - 1)
+        iR = math.min(nBins - 1, i + 1)
+        array.set(fCs, i, (array.get(fC, iL) + 2.0 * array.get(fC, i) + array.get(fC, iR)) / 4.0)
+        array.set(fBs, i, (array.get(fB, iL) + 2.0 * array.get(fB, i) + array.get(fB, iR)) / 4.0)
+    sC = array.sum(fCs)
+    sB = array.sum(fBs)
+    for i = 0 to nBins - 1
+        array.set(fC, i, array.get(fCs, i) / sC)
+        array.set(fB, i, array.get(fBs, i) / sB)
+
+// ---------------- empirical survival functions on bin grid -------------------
+Sc = array.new<float>(nBins, 0.0)
+Sb = array.new<float>(nBins, 0.0)
+accC = 0.0,  accB = 0.0
+for i = nBins - 1 to 0
+    accC += array.get(fC, i)
+    accB += array.get(fB, i)
+    array.set(Sc, i, accC)
+    array.set(Sb, i, accB)
+
+// ---------------- ENTRY gate: direct empirical >=_st  ------------------------
+stDom_def = true
+for i = 0 to nBins - 1
+    if array.get(Sc, i) + 1e-9 < array.get(Sb, i)
+        stDom_def := false
+
+// ---------------- diagnostics (Paper 1 + Paper 2) ----------------------------
+logL = array.new<float>(nBins, 0.0)
+ell  = array.new<float>(nBins, 1.0)
+for i = 0 to nBins - 1
+    v = array.get(fB, i) / array.get(fC, i)        // ell = fP/fQ, P=baseline
+    array.set(ell,  i, v)
+    array.set(logL, i, math.log(v))
+
+// Paper 1 Thm 3.5(i): baseline <=_lr current  <=>  ell nonincreasing
+monoDownLR = true
+for i = 1 to nBins - 1
+    if array.get(logL, i) > array.get(logL, i - 1) + 1e-9
+        monoDownLR := false
+
+// Paper 1 Thm 3.5(ii): concavity of log(fP/fQ) = relative log-concavity
+concave = true
+for i = 0 to nBins - 3
+    d2 = array.get(logL, i + 2) - 2.0 * array.get(logL, i + 1) + array.get(logL, i)
+    if d2 > 1e-9
+        concave := false
+
+// Paper 2 Prop 2.9 -- leftmost non-trivial bin = x_0
+leftIdx = 0
+for i = 0 to nBins - 1
+    if array.get(fB, i) > 1.5 / (nBase + nBins)
+        leftIdx := i
+        break
+ellL       = array.get(ell, leftIdx)
+endpointOK = ellL >= 1.0 + endpMrg
+
+// {ell >= 1} initial interval check (Prop 2.9 strict)
+inA = true,  intervalOK = true
+for i = leftIdx to nBins - 1
+    above = array.get(ell, i) >= 1.0
+    if inA and not above
+        inA := false
+    else if (not inA) and above
+        intervalOK := false
+
+p29_st = endpointOK and intervalOK                     // strict Prop 2.9 sufficient
+
+// ---------------- Paper 3 Thm 1: Gnedin beta(2) optimal-stopping exit -------
+var int   t  = 0
+var float pE = na
+inLong = strategy.position_size > 0
+if inLong
+    t += 1
+else
+    t  := 0
+    pE := na
+
+xNow      = inLong ? math.log(pE / close) : na          // adverse log-excursion
+remain    = math.max(1, Tbars - t)
+beta2Thr  = 2.0 / remain                                // Gnedin (9)
+gnedinExit = inLong and xNow <= beta2Thr
+
+// ---------------- Paper 3 Thm 3: discrete delta_k cutoffs (optional) --------
+var float[] delta = array.from(
+     1.353, 0.803, 0.572, 0.445, 0.363, 0.303, 0.266,
+     0.235, 0.210, 0.190, 0.173)
+deltaExit = false
+if useDelta and inLong
+    kHat = math.max(0, math.floor(xNow / sig))
+    kUse = math.min(math.max(kHat, rankK - 1), array.size(delta) - 1)
+    tauR = remain / float(Tbars)
+    deltaExit := tauR <= array.get(delta, kUse)
+
+timeExit = inLong and t >= Tbars
+
+// ---------------- entries / exits --------------------------------------------
+enterLong = not inLong and stDom_def
+if enterLong
+    strategy.entry("L", strategy.long)
+    pE := close
+    t  := 0
+
+if inLong and (gnedinExit or deltaExit or timeExit or not stDom_def)
+    reason = gnedinExit ? "beta(2)"   :
+             deltaExit  ? "delta_k"   :
+             timeExit   ? "T"         : "order-flip"
+    strategy.close("L", comment = reason)
+
+// ---------------- visuals + diagnostic table ---------------------------------
+plotshape(enterLong,            "entry",   shape.triangleup,
+     location.belowbar, color.new(color.teal, 0), size = size.tiny)
+plotshape(inLong and gnedinExit,"beta",    shape.xcross,
+     location.abovebar, color.new(color.red , 0), size = size.tiny)
+bgcolor(stDom_def ? color.new(color.teal, 90) : na)
+
+var table dbg = table.new(position.top_right, 2, 9, border_width = 1)
+if barstate.islast
+    table.cell(dbg,0,0,">=_st (entry)"), table.cell(dbg,1,0, str.tostring(stDom_def))
+    table.cell(dbg,0,1,"ell(x0)")      , table.cell(dbg,1,1, str.tostring(ellL,"#.###"))
+    table.cell(dbg,0,2,"endpointOK")   , table.cell(dbg,1,2, str.tostring(endpointOK))
+    table.cell(dbg,0,3,"intervalOK")   , table.cell(dbg,1,3, str.tostring(intervalOK))
+    table.cell(dbg,0,4,"Prop 2.9 st")  , table.cell(dbg,1,4, str.tostring(p29_st))
+    table.cell(dbg,0,5,"K monotone")   , table.cell(dbg,1,5, str.tostring(monoDownLR))
+    table.cell(dbg,0,6,"K concave")    , table.cell(dbg,1,6, str.tostring(concave))
+    table.cell(dbg,0,7,"beta2 thr")    , table.cell(dbg,1,7, str.tostring(beta2Thr,"#.####"))
+    table.cell(dbg,0,8,"t / T")        , table.cell(dbg,1,8, str.tostring(t)+" / "+str.tostring(Tbars))
